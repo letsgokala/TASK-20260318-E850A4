@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+.env
+.env.age
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+node_modules/
+frontend/dist/
+/storage/
+/backups/

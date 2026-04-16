@@ -1,0 +1,103 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_password
+      POSTGRES_DB: eagle_point
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d eagle_point"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    # env_file is the default (plaintext) path. For encrypted config,
+    # comment this block out and mount ``.env.age`` plus an age identity
+    # at /app/.env.age and /run/secrets/env-age.key — the entrypoint
+    # (``scripts/entrypoint.sh``, baked in at image build time) will
+    # decrypt to /app/.env at container start, 0600, and remove it on
+    # exit. See README "Encrypted sensitive configuration" for the
+    # full operator flow.
+    env_file:
+      - .env
+    # environment:
+    #   ENV_AGE_KEY_FILE: /run/secrets/env-age.key
+    # volumes:
+    #   - ./.env.age:/app/.env.age:ro
+    #   - ./secrets/env-age.key:/run/secrets/env-age.key:ro
+    volumes:
+      - storage:/storage
+      - backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backup-scheduler:
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile.backup
+    volumes:
+      - storage:/storage:ro
+      - backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-eagle_point}
+      POSTGRES_USER: ${POSTGRES_USER:-app_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      DB_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "echo '0 2 * * * sh /backup.sh >> /backups/cron.log 2>&1' | crontab - &&
+             crond -f -l 8"
+    restart: unless-stopped
+
+  # Dedicated PostgreSQL database for the test suite. Kept separate from the
+  # `db` service so tests have a clean schema and cannot corrupt dev data.
+  # Uses tmpfs so each container start is a fresh, fast DB.
+  test-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_password
+      POSTGRES_DB: eagle_point_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d eagle_point_test"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.tests
+    environment:
+      TESTING: "1"
+      # Main test lane now runs against PostgreSQL (no more SQLite rewrites).
+      # This is the database contract the app actually runs on in production.
+      DATABASE_URL: "postgresql+asyncpg://app_user:app_password@test-db:5432/eagle_point_test"
+      TEST_DATABASE_URL_PG: "postgresql+asyncpg://app_user:app_password@test-db:5432/eagle_point_test"
+      SECRET_KEY: "test-secret-key-for-jwt-signing-1234567890abcdef"
+      SENSITIVE_FIELD_KEY: "BR0H2dkd0K1VwmPdrGzwl3slTGLCx4R99DK6l_jU3T8="
+      ENABLE_DUPLICATE_CHECK_API: "true"
+    depends_on:
+      test-db:
+        condition: service_healthy
+    working_dir: /app
+    # entrypoint is provided at `docker compose run` time by run_tests.sh
+
+volumes:
+  pgdata:
+  storage:
+  backups:

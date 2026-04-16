@@ -1,0 +1,32 @@
+FROM python:3.11-slim
+
+# Install Node.js so the frontend Vitest suite can run alongside pytest.
+# nodejs is needed for Vite/Vitest; npm comes from the same repository package.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir pytest-cov
+
+# Frontend deps — install before copying the full tree so this layer is cached
+# across code changes in app/.
+COPY frontend/package.json frontend/package-lock.json* /app/frontend/
+RUN cd /app/frontend && npm install --no-audit --no-fund
+
+COPY . .
+
+# Default env vars for the test environment. DATABASE_URL is overridden at
+# runtime by docker-compose to point at the ``test-db`` service; this default
+# only applies if someone runs the image outside of compose.
+ENV TESTING=1
+ENV DATABASE_URL=postgresql+asyncpg://app_user:app_password@localhost:5432/eagle_point_test
+ENV SECRET_KEY=test-secret-key-for-jwt-signing-1234567890abcdef
+ENV SENSITIVE_FIELD_KEY=BR0H2dkd0K1VwmPdrGzwl3slTGLCx4R99DK6l_jU3T8=
+ENV ENABLE_DUPLICATE_CHECK_API=true

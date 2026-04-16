@@ -1,0 +1,12 @@
+[run]
+source = app
+concurrency = greenlet,thread
+omit =
+    */venv/*
+    */.venv/*
+    */tests/*
+    app/rotate_key.py
+    app/seed_admin.py
+
+[report]
+skip_empty = True
