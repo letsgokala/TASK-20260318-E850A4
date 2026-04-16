@@ -11,8 +11,8 @@ Status-code convention:
 - `202 Accepted` — long-running work started
 - `204 No Content` — successful mutation with no body
 - `400 Bad Request` — malformed input or invalid business argument
-- `401 Unauthorized` — missing or invalid token
-- `403 Forbidden` — authenticated but not permitted
+- `401 Unauthorized` — token present but invalid/expired, or user not found/inactive
+- `403 Forbidden` — Bearer credentials absent on a protected route (FastAPI's default `HTTPBearer` behavior), **or** authenticated but lacking the required role
 - `404 Not Found` — resource missing or scoped out
 - `409 Conflict` — state conflict (e.g. over-budget, report not ready)
 - `413 Payload Too Large` — file size exceeds 20 MB cap
@@ -87,12 +87,13 @@ Trigger restore from the named backup.
 
 ### `POST /admin/integrity-check`
 Re-hash every stored material file and compare against the persisted SHA-256.
-**Response 200:** `{ "checked", "mismatches": [...] }`.
+**Response 200:** `{ "total": N, "ok": N, "missing": [...], "hash_mismatch": [...], "missing_count": N, "mismatch_count": N }` — each entry in `missing` / `hash_mismatch` carries `version_id`, `material_id`, and `storage_path`; `hash_mismatch` entries additionally include `expected_hash` and `actual_hash`.
 
 ### `GET /admin/audit-logs`
 Query the audit log.
-**Query params:** `user_id?`, `action?`, `resource_type?`, `from_date?`, `to_date?`, `page?`, `page_size?`.
-**Response 200:** `{ "items": [...], "total": N }`.
+**Query params:** `user_id?`, `action?` (substring match, case-insensitive), `resource_type?`, `from?` (alias for `from_date`), `to?` (alias for `to_date`), `page?` (default 1), `page_size?` (default 50, max 200).
+**Response 200:** `{ "items": [ { "id", "user_id", "action", "resource_type", "resource_id", "details", "ip_address", "user_agent", "created_at" } ], "total": N, "page": N, "page_size": N }`.
+**Note:** this endpoint is itself a sensitive read and is audited — a query here writes a `SENSITIVE_READ` row for the acting system admin before returning.
 
 ---
 
@@ -177,7 +178,8 @@ List a registration's materials and versions.
 **Visibility:** reviewers cannot list a draft registration's materials.
 
 ### `GET /registrations/versions/{version_id}/download`
-Stream a material version file.
+Stream a material version file. Every download is a sensitive read and is written to the audit log **before** the bytes are streamed: under `AUDIT_FAIL_CLOSED=1` (default) a failure to persist the audit row blocks the download with a 500; under `AUDIT_FAIL_CLOSED=0` the failure is mirrored to the emergency log and the response carries `X-Audit-Log-Fallback: emergency-log`.
+**Errors:** 403 (not permitted to view the registration — e.g. financial_admin, non-owner applicant, reviewer on a draft), 404 (version, material, registration, or file missing on disk), 500 (audit write failed under fail-closed mode).
 
 ### `GET /registrations/{registration_id}/materials/upload-info`
 Storage quota and supplementary-window eligibility.
@@ -193,7 +195,7 @@ Submit supplementary materials during the 72-hour post-deadline window.
 **Content-Type:** `multipart/form-data`.
 **Form fields:** `correction_reason` (text, required), `material_ids` (repeatable), `files` (repeatable, one-to-one with `material_ids`).
 **Response 201:** `MaterialVersionResponse[]`.
-**Errors:** 403 (outside window or already used), 422 (count mismatch / empty reason).
+**Errors:** 400 (count mismatch between `files` and `material_ids`, empty file list, or duplicate `material_ids`), 403 (outside window, already used, or not the owner), 409 (registration not in an upload-eligible state or version cap reached), 422 (empty `correction_reason` or needs_correction without reason).
 
 ---
 
@@ -317,9 +319,9 @@ Retrieve a single task.
 **Errors:** 403 (someone else's task), 404.
 
 ### `GET /reports/tasks/{task_id}/download`
-Download the XLSX file. Every download is written to the audit log.
+Download the XLSX file. Every download is written to the audit log **before** the bytes are streamed: under `AUDIT_FAIL_CLOSED=1` (default) a failure to persist the audit row blocks the download with a 500; under `AUDIT_FAIL_CLOSED=0` the failure is mirrored to the emergency log and the response carries `X-Audit-Log-Fallback: emergency-log`.
 **Response 200:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` attachment.
-**Errors:** 403 (not your task), 404 (file missing on disk), 409 (report not ready).
+**Errors:** 403 (not your task), 404 (file missing on disk), 409 (report not ready), 500 (audit write failed under fail-closed mode).
 
 ---
 

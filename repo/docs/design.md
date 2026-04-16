@@ -14,7 +14,7 @@ A web application for managing activity registrations, peer review, and funding 
 |---|---|
 | Backend API | FastAPI (Python 3.11+) |
 | ORM | SQLAlchemy 2.x (async) |
-| Database | PostgreSQL 15 |
+| Database | PostgreSQL 16 |
 | Async driver | asyncpg |
 | Migrations | Alembic |
 | Auth | JWT (python-jose) + bcrypt |
@@ -51,7 +51,7 @@ A web application for managing activity registrations, peer review, and funding 
 
 ### Core Entities
 
-**User** — platform accounts with roles: `applicant`, `reviewer`, `admin`, `financial_admin`
+**User** — platform accounts with roles: `applicant`, `reviewer`, `financial_admin`, `system_admin`
 
 **CollectionBatch** — a submission campaign with a `submission_deadline` and an auto-computed `supplementary_deadline` (deadline + 72 hours, PostgreSQL computed column)
 
@@ -79,14 +79,18 @@ A web application for managing activity registrations, peer review, and funding 
 
 ### Authentication & Authorization
 
-- JWT tokens are issued at `/auth/token` and expire after a configurable duration (default 60 minutes)
+- JWT tokens are issued at `POST /api/v1/auth/login` and expire after a configurable duration (default 60 minutes)
 - Passwords are hashed with bcrypt; plaintext is never stored
 - Account lockout: configurable attempt limit within a rolling window (default 10 attempts / 5 minutes → 30-minute lockout)
 - Role-based access control is enforced at the route handler level via FastAPI dependencies
 
+### Transactional audit fail-closed
+
+The audit log is written **in the same transaction** as the domain mutation. The middleware sets a per-request context on import-time; a SQLAlchemy `before_commit` event hook reads that context and stages an `AuditLog` row on the session before the commit flushes. If the audit-row insert fails, the whole unit of work rolls back and the client sees a 500 — a mutating request can never succeed without a matching audit row. Sensitive reads (material/report downloads) write their audit row and commit before streaming the file; a failure blocks the download under `AUDIT_FAIL_CLOSED=1`.
+
 ### PII Encryption
 
-Sensitive applicant fields (`applicant_name`, `applicant_id_number`, `applicant_phone`, `applicant_email`) are encrypted at rest using symmetric Fernet encryption before being written to the database. The encryption key is provided via the `SENSITIVE_FIELD_KEY` environment variable.
+Sensitive applicant fields (`applicant_id_number`, `applicant_phone`, `applicant_email`) are encrypted at rest using symmetric Fernet encryption before being written to the database. `applicant_name` is PII-masked in responses based on role, but is stored in plaintext for sorting and reviewer search. The encryption key is provided via the `SENSITIVE_FIELD_KEY` environment variable.
 
 ### File Upload Security
 
@@ -114,17 +118,18 @@ Four code paths deliberately swallow their own exceptions so a downstream failur
 
 Every suppressed failure writes an `ERROR` log line *and* appends a JSON record via `app/utils/emergency_log.py` to `/var/log/eagle_point/critical_failures.jsonl` (override with the `EMERGENCY_LOG_PATH` environment variable). Operators reviewing a host after an incident can recover the full failure history from that file even when centralized logging is unavailable.
 
-#### Fail-closed modes
+#### Fail-closed modes (default)
 
-Three env-var flags flip the default fail-open behavior to **fail-closed** so regulated tenants can enforce that the corresponding invariant must hold or the request fails:
+Four env-var flags control whether the audit/decryption/validation/alert paths **fail-closed (the default)** — surfacing failures as 5xx — or fail-open, suppressing the failure so the caller's response still succeeds. Fail-closed is the default because the audit report flagged "silent success" on compliance-critical paths as a gap; operators who need availability over strict correctness can opt out per-path:
 
-| Flag | Effect when `"1"` |
-|---|---|
-| `AUDIT_FAIL_CLOSED` | Audit-middleware write failure raises `RuntimeError` → 500 response; fail-open mode instead sets `X-Audit-Log-Fallback: emergency-log` on the response header |
-| `DECRYPT_FAIL_CLOSED` | `decrypt_value()` raises on `InvalidToken`; fail-open mode returns the raw ciphertext so reads don't break |
-| `VALIDATION_FAIL_CLOSED` | `auto_validate_on_submit()` raises; fail-open mode persists nothing but lets the submit succeed |
+| Flag | Default | Effect when `"1"` (default) | Effect when `"0"` |
+|---|---|---|---|
+| `AUDIT_FAIL_CLOSED` | `"1"` | Audit row is written in the same transaction as the domain write; a failure rolls back the whole unit of work → 500 response, no committed mutation. | Transactional audit hook is skipped; the middleware writes a best-effort audit row post-response and surfaces any failure via `X-Audit-Log-Fallback: emergency-log`. |
+| `DECRYPT_FAIL_CLOSED` | `"1"` | `decrypt_value()` raises on `InvalidToken` | Returns the raw ciphertext so reads don't break |
+| `VALIDATION_FAIL_CLOSED` | `"1"` | `auto_validate_on_submit()` raises | Persists nothing but lets the submit succeed |
+| `ALERT_FAIL_CLOSED` | `"1"` | `check_and_notify_breaches()` is invoked BEFORE the handler's commit and raises on emission failure; the whole unit of work (state change + notifications) rolls back atomically and the client sees a 500 — never a committed write with no matching alert | Alert-emission failure is swallowed; the write-side handler still succeeds |
 
-Defaults are `"0"` so the documented fail-open behavior is preserved out of the box. When `"0"`, the emergency-log fallback is still written, so nothing disappears silently. Pinned by `tests/test_fail_closed_modes.py`.
+Regardless of the flag setting, the emergency-log fallback is always written, so nothing disappears silently. Pinned by `tests/test_fail_closed_modes.py`.
 
 ---
 
@@ -148,12 +153,12 @@ Supplementary submission is available for **one use only**, within 72 hours afte
 
 | Type | Description |
 |---|---|
-| `audit` | Full audit log export with optional user/action/date filters |
-| `compliance` | Registration status summary by batch — shows submitted, approved, rejected, waitlisted counts |
-| `whitelist` | Lists all approved registrations and their materials per batch |
-| `reconciliation` | Finance reconciliation — matches transactions against budgets with optional batch and date filters |
+| `audit` | Full audit log export — one row per audit record with optional user/action/date filters (sheet: "Audit Log"). |
+| `compliance` | Per-registration compliance workbook (sheet: "Compliance"). Columns: `Registration ID`, `Applicant Name`, `Status`, `Materials Complete`, `Review History Summary`, `Flagged Issues` (supplementary usage and duplicate-file counts). Optional `batch_id`, `from_date`, `to_date` filters. |
+| `whitelist` | Two-sheet workbook — sheet 1 ("Approved Registrations") lists every registration in `approved` or `promoted_from_waitlist`; sheet 2 ("Approved Materials") lists the SHA-256, filename, and checklist label of every material version attached to those approved registrations. Optional `batch_id` filter. |
+| `reconciliation` | Finance reconciliation — per-registration budget vs. income/expense/balance with overspending flag (sheet: "Reconciliation"). Optional `batch_id`, `from_date`, `to_date` filters. |
 
-Reports are generated asynchronously. The caller polls `GET /reports/{task_id}` until `status` is `completed`, then downloads via `GET /reports/{task_id}/download`.
+Reports are generated via `POST /api/v1/reports/generate/{report_type}`. Small result sets (≤ 5000 rows) are generated synchronously in-process and the response already carries `status=complete`; larger result sets dispatch to a FastAPI `BackgroundTask`. In either case the caller polls `GET /api/v1/reports/tasks/{task_id}` until `status` is `complete`, then downloads via `GET /api/v1/reports/tasks/{task_id}/download`. Report downloads are sensitive reads and are audited before the file is streamed (see "Transactional audit fail-closed").
 
 ---
 
@@ -183,18 +188,20 @@ All configuration is via environment variables (or a `.env` file). See `.env.exa
 ./run_tests.sh
 ```
 
-Tests run inside Docker. There are two test lanes:
+Tests run inside Docker. The suite uses one canonical lane:
 
-1. **Default lane (SQLite).** The bulk of unit and API-level tests run against an in-memory SQLite database via `StaticPool`. PostgreSQL-specific column types (`JSONB`, `INET`) are rewritten to `JSON` / `Text`, and computed columns (e.g. `collection_batches.supplementary_deadline`) are stripped so they can be set explicitly in Python. This lane is fast and runs on every push.
+1. **Backend lane (PostgreSQL).** `pytest tests/` runs with coverage, executed inside the `tests` container against the `test-db` service (PostgreSQL 16). Every test gets a fresh schema via `Base.metadata.drop_all` / `create_all` — slower than the previous in-memory SQLite lane, but the only way to exercise production behavior: `JSONB` operators, `INET` CIDR queries, computed columns (e.g. `collection_batches.supplementary_deadline`), native enums, and `timestamptz` round-trips. The SQLite rewrites in the old conftest are gone. `tests/test_postgres_integration.py` runs as part of this lane.
 
-2. **PostgreSQL lane (opt-in).** `tests/test_postgres_integration.py` exercises production-only contracts — computed columns, JSONB operator queries, and timezone-aware lockout persistence — against a real PostgreSQL 15 instance without any schema stripping. Activate by setting `TEST_DATABASE_URL_PG`:
+2. **Frontend lane.** Vitest against `frontend/src/__tests__/` inside the same test image.
 
-   ```bash
-   export TEST_DATABASE_URL_PG=postgresql+asyncpg://app_user:app_password@localhost:5432/eagle_point_test
-   pytest tests/test_postgres_integration.py -v
-   ```
+For manual runs outside Docker, point the backend at a reachable PostgreSQL 16 instance:
 
-   The lane is automatically skipped when that variable is unset, so local and CI runs without a PG instance continue to pass.
+```bash
+export TEST_DATABASE_URL_PG=postgresql+asyncpg://app_user:app_password@localhost:5432/eagle_point_test
+pytest tests/test_postgres_integration.py -v
+```
+
+The PG-only integration file auto-skips when `TEST_DATABASE_URL_PG` is unset, so partial local runs continue to work.
 
 Frontend tests run separately under Vitest:
 
@@ -208,7 +215,7 @@ cd frontend && npm install && npm test
 docker compose up
 ```
 
-The API is available at `http://localhost:8000`; the Vue SPA at `http://localhost:5173` (dev server) or `http://localhost:8080` (Nginx container).
+The API and the bundled Vue SPA are both served at `http://localhost:8000`. FastAPI mounts the built SPA from `frontend/dist/` at startup; the Vite dev server is optional for local UI work and is not exposed by `docker-compose.yml`.
 
 ### Database Migrations
 
